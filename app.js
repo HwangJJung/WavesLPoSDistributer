@@ -1,5 +1,6 @@
-var request = require('sync-request');
 var fs = require('fs');
+var axios = require('axios');
+var Promise = require("bluebird");
 
 /**
  * w0utje's edit of Hawky's LPoSDistributor
@@ -31,12 +32,14 @@ var config = {
     address: '',
     startBlockHeight: 559474,
     endBlock: 567751,
+    startBlock: 462000,
     distributableMrtPerBlock: 30,
     filename: 'payment', //.json added automatically
     paymentid: 11,
     //node: 'http://127.0.0.1:6869',
     node: 'http://nodes.wavesnodes.com',
-    percentageOfFeesToDistribute: 100
+    percentageOfFeesToDistribute: 100,
+    interval: 100,
 };
  
 
@@ -52,7 +55,14 @@ if (fs.existsSync(prevleaseinfofile))
 {
 	console.log("reading" + prevleaseinfofile + " file");
 	var data=fs.readFileSync(prevleaseinfofile);
-	var prevleaseinfo=JSON.parse(data);
+  if (!data) {
+    throw Error("DO NOT EXIST prevleaseinfofile. plz check your file.");
+  }
+  try {
+    var prevleaseinfo= JSON.parse(data);
+  } catch (e) {
+    throw Error("JSON parse error. check your data.", data);
+  }
 	myLeases = prevleaseinfo["leases"];
 	myCanceledLeases = prevleaseinfo["canceledleases"];
 	currentStartBlock = config.startBlockHeight;
@@ -80,25 +90,26 @@ var myForgedBlocks = [];
  */
 var start = function() {
     console.log('getting blocks...');
-    var blocks = getAllBlocks();
-    console.log('preparing datastructures...');
-    prepareDataStructure(blocks);
-    console.log('preparing payments...');
-    myForgedBlocks.forEach(function(block) {
-        if (block.height >= config.startBlockHeight && block.height <= config.endBlock) {
-            var blockLeaseData = getActiveLeasesAtBlock(block);
-            var activeLeasesForBlock = blockLeaseData.activeLeases;
-            var amountTotalLeased = blockLeaseData.totalLeased;
+    getAllBlocks().then(function(blocks) {
+      console.log('preparing datastructures...');
+      prepareDataStructure(blocks);
+      console.log('preparing payments...');
+      myForgedBlocks.forEach(function(block) {
+          if (block.height >= config.startBlockHeight && block.height <= config.endBlock) {
+              var blockLeaseData = getActiveLeasesAtBlock(block);
+              var activeLeasesForBlock = blockLeaseData.activeLeases;
+              var amountTotalLeased = blockLeaseData.totalLeased;
 
-            distribute(activeLeasesForBlock, amountTotalLeased, block);
-            BlockCount++;
-        }
+              distribute(activeLeasesForBlock, amountTotalLeased, block);
+              BlockCount++;
+          }
+      });
+      //Get last block
+      LastBlock = blocks.slice(-1)[0] ;  
+      pay();
+      console.log("blocks forged: " + BlockCount);
     });
-    //Get last block
-    LastBlock = blocks.slice(-1)[0] ;
-	
-    pay();
-    console.log("blocks forged: " + BlockCount);
+  
 };
 
 /**
@@ -158,50 +169,65 @@ var prepareDataStructure = function(blocks) {
     });
 };
 
+var makeBlockNumberArray = function(startBlock) {
+  var interval = config.interval || 100;
+  var endBlock = config.endBlock || 567751;  
+  var currentStartBlock = startBlock || 0;
+  var blockNumberArray;
+  
+  while (currentStartBlock <= endBlock) {
+      blockNumberArray.push(currentStartBlock);
+      currentStartBlock = startBlock + interval - 1;
+  }
+  if (blockNumberArray[blockNumberArray.length - 1] !== endBlock) {
+    blockNumberArray.push(endBlock);
+  }
+  return blockNumberArray;
+}
+
 /**
  * Method that returns all relevant blocks.
  *
  * @returns {Array} all relevant blocks
  */
+
 var getAllBlocks = function() {
-    // leases have been resetted in block 462000, therefore, this is the first relevant block to be considered
-    //var firstBlockWithLeases=462000;
-    //var currentStartBlock = firstBlockWithLeases;
-    var blocks = [];
-
-    while (currentStartBlock < config.endBlock) {
-        var currentBlocks;
-
-        if (currentStartBlock + 99 < config.endBlock) {
-            console.log('getting blocks from ' + currentStartBlock + ' to ' + (currentStartBlock + 99));
-            currentBlocks = JSON.parse(request('GET', config.node + '/blocks/seq/' + currentStartBlock + '/' + (currentStartBlock + 99), {
-                'headers': {
-                    'Connection': 'keep-alive'
-                }
-            }).getBody('utf8'));
-        } else {
-            console.log('getting blocks from ' + currentStartBlock + ' to ' + config.endBlock);
-            currentBlocks = JSON.parse(request('GET', config.node + '/blocks/seq/' + currentStartBlock + '/' + config.endBlock, {
-                'headers': {
-                    'Connection': 'keep-alive'
-                }
-            }).getBody('utf8'));
-        }
+  var blockNumberArray = makeBlockNumberArray(config.startBlock);
+  var interval = config.interval;
+  return Promise.reduce(blockIntervalArray, function(allBlocks, currentblock, index, length) {
+    if (index + 1 === length) {
+      return allBlocks;
+    }
+    var upperBlock = blockIntervalArray[index + 1];
+    var wavesNodeUrl = config.node + '/blocks/seq/' + currentblock + '/' + upperBlock;
+    console.log('getting blocks from ' + wavesNodeUrl);      
+    return axios({
+      method: 'get',
+      url: wavesNodeUrl,
+      headers: {
+        'Connection': 'keep-alive'
+      }
+    })
+    .then(function(response) {
+      console.log("response::" + response);
+      var currentBlocks = response;
+      if (Array.isArray(currentBlocks)) {
         currentBlocks.forEach(function(block) {
-            if (block.height <= config.endBlock) {
-                blocks.push(block);
+            if (block.height <= endBlock) {
+              allBlocks.push(block);
+              return allBlocks;
             }
         });
+      } else {
+        throw new Error("block data is not array.", currentBlocks);
+      }
+    })
+    .catch(error) {
+      console.log(error);
+    };
+  }, config.startBlock);
+}
 
-        if (currentStartBlock + 100 < config.endBlock) {
-            currentStartBlock += 100;
-        } else {
-            currentStartBlock = config.endBlock;
-        }
-    }
-
-    return blocks;
-};
 
 /**
  * This method distributes either Waves fees and MRT to the active leasers for
